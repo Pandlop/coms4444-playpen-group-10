@@ -1,0 +1,35 @@
+scenario,shape,valid,area,perimeter,score,reason
+scenarios/players/player9/crown.json,"octagon 65.4x55.4 (2 gates, 10 pieces)",true,2992.77,200.00,30027.67,valid
+scenarios/players/player9/hallways.json,"30x30 (2 gates, 24 pieces)",true,900.00,120.00,9930.00,valid
+scenarios/players/player6/spiral.json,"octagon 72.4x72.4 (2 gates, 10 pieces)",true,4345.58,240.00,9521.17,valid
+scenarios/players/player2/cool.json,"20x11 (2 gates, 8 pieces)",true,220.00,62.00,8712.00,valid
+scenarios/players/player9/lollipop_trap.json,"30x30 (2 gates, 12 pieces)",true,900.00,120.00,4540.00,valid
+scenarios/players/player4/easy_rectangle_generous.json,"30x30 (3 gates, 11 pieces)",true,900.00,120.00,2540.00,valid
+scenarios/players/player9/32_edge_concave_room.json,"30x30 (2 gates, 6 pieces)",true,900.00,120.00,2540.00,valid
+scenarios/players/player8/gate_bonus.json,"28x10 (2 gates, 4 pieces)",true,280.00,76.00,2332.00,valid
+scenarios/players/player5/rectangle_room.json,"L 26x25 (3 gates, 14 pieces)",true,625.00,102.00,2146.00,valid
+scenarios/players/player10/i_room.json,"26x26 (1 gate, 9 pieces)",true,676.00,104.00,2040.00,valid
+scenarios/players/player7/square_room_w_cutouts.json,"30x24 (2 gates, 10 pieces)",true,720.00,108.00,2014.00,valid
+scenarios/players/player4/irregular_room_second_gate.json,"L 30x30 (3 gates, 14 pieces)",true,875.00,120.00,1972.50,valid
+scenarios/players/player6/n_shaped_room.json,"30x18 (2 gates, 9 pieces)",true,540.00,96.00,1942.00,valid
+scenarios/players/player8/irregular_blob.json,"30x30 (2 gates, 19 pieces)",true,900.00,120.00,1940.00,valid
+scenarios/players/player8/octagon_shape.json,"22x22 (2 gates, 8 pieces)",true,484.00,88.00,1804.00,valid
+scenarios/invalid_examples.json,"30x16 (3 gates, 8 pieces)",true,480.00,92.00,1784.00,valid
+scenarios/players/player6/hallway.json,"30x12 (2 gates, 11 pieces)",true,360.00,84.00,1736.00,valid
+scenarios/players/player10/triangle_room.json,"20x20 (2 gates, 8 pieces)",true,400.00,80.00,1660.00,valid
+scenarios/players/player5/l_shaped_room.json,"20x19 (3 gates, 11 pieces)",true,380.00,78.00,1626.00,valid
+scenarios/players/player4/l_shaped_room_scarce.json,"23x10 (2 gates, 8 pieces)",true,230.00,66.00,1624.00,valid
+scenarios/players/player5/angled_room.json,"21x20 (3 gates, 11 pieces)",true,420.00,82.00,1541.00,valid
+scenarios/players/player7/horseshoe_room.json,"30x8 (2 gates, 7 pieces)",true,240.00,76.00,1352.00,valid
+scenarios/players/player1/star.json,"14x13 (1 gate, 5 pieces)",true,182.00,54.00,1182.00,valid
+scenarios/players/player7/spiral_room.json,"12x8 (2 gates, 6 pieces)",true,96.00,40.00,1172.00,valid
+scenarios/players/player1/B.json,"30x5 (1 gate, 8 pieces)",true,150.00,70.00,1150.00,valid
+scenarios/players/player1/coms4444.json,"30x5 (1 gate, 8 pieces)",true,150.00,70.00,1150.00,valid
+scenarios/players/player3/triangle.json,"10x10 (1 gate, 4 pieces)",true,100.00,40.00,1060.00,valid
+scenarios/players/player3/trapezoid.json,"10x8 (2 gates, 4 pieces)",true,80.00,36.00,750.00,valid
+scenarios/l_shaped_room.json,none,false,0.00,0.00,0.00,no inventory-feasible supported shapes with face lengths 5..30
+scenarios/limits_tight_room_favors_small_shape.json,none,false,0.00,0.00,0.00,124 positive-scoring inventory-feasible shapes tried; none fit the room in the boundary/grid heading search
+scenarios/players/player10/zig_room.json,none,false,0.00,0.00,0.00,"best remaining shape 28x20 (2 gates, 10 pieces) has projected score -20.00; skipped because returning no construction scores 0.00"
+scenarios/players/player2/hard.json,none,false,0.00,0.00,0.00,"Not enough right connectors (need 4, have 2) -- not attempting a build"
+scenarios/players/player2/simple_room.json,none,false,0.00,0.00,0.00,"Not enough right connectors (need 4, have 2) -- not attempting a build"
+scenarios/players/player3/house.json,none,false,0.00,0.00,0.00,"Not enough right connectors (need 4, have 2) -- not attempting a build"
