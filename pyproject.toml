@@ -5,6 +5,7 @@ description = "Simulator for COMS 4444 Project 2: Playpen"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "ortools>=9.15.6755",
     "shapely>=2.1.1",
 ]
 
