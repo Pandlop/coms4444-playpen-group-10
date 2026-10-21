@@ -1,0 +1,589 @@
+import heapq
+import math
+import time
+from collections import Counter
+from itertools import islice
+
+import src.constants as c
+from players.player0 import Player
+from players.player10.assign import Assigner, Assignment
+from players.player10.beam import free_shapes
+from players.player10.freeform import (
+    MAX_FACES,
+    Faces,
+    Grower,
+    Loop,
+    area_of,
+    corners,
+)
+from players.player10.placement import RoomSearch
+from players.player10.polish import Polisher
+from players.player10.raster import raster_loops
+from players.player10.shapes import (
+    CORNERS_NEEDED,
+    HEADING_STEP_DEG,
+    HEXAGON,
+    L_SHAPE,
+    MEASURES,
+    OCTAGON,
+    RECTANGLE,
+    SYMMETRY_DEG,
+    U_SHAPE,
+    Shape,
+    contains_smaller,
+    free_shape,
+    headed_faces,
+    inner_radius,
+    inner_rectangles,
+    make_shape,
+)
+from src.enclosure import Construction, score_construction, validate_construction
+from src.pieces import Connector, ConnectorType, Piece, PieceType
+
+# CPU seconds the search may use. The simulator allows 300; nothing can interrupt
+# a player on Windows, so it stops itself with room to spare for the last step it
+# is in the middle of. (The submission check runs with 60 s, so a long run shows
+# there as a timeout warning, not a failure.)
+TIME_BUDGET = 270.0
+# how far into the budget each stage of the search may run; growing gets the rest
+RECTANGLE_SHARE = 0.10
+L_SHARE = 0.20
+OCTAGON_SHARE = 0.32
+U_SHARE = 0.42
+# Filling the room with grid cells (raster.py): the cell sides tried, and the most
+# time it may take. Only sides whose every multiple up to the face limit can be
+# built are used, paired so that one-cell steps use the most plentiful pieces.
+RASTER_SIZES = (5, 6, 7, 8, 9, 10, 12, 15)
+RASTER_PAIRS = 24
+RASTER_SHARE = 0.1  # of the whole budget, at most
+RASTER_MAX_FACES = 900  # piece assignment walks the faces one level deep each
+# Loops walked along the walls (beam.py): few win outright, but the shapes they find
+# are starting points for growing that the shape families would never give.
+BEAM_SECONDS = 8.0
+GROW_SHARE = 0.96  # growing the best shapes found so far (freeform.py)
+# polishing the best rectilinear shape (polish.py) gets the rest
+# growing asks for pieces for thousands of loops, so each ask gets less effort
+GROW_ASSIGN_NODES = 3000
+MAX_SEEDS = 6
+# the best rectangle is also grown from other places it fits, this many at most
+EXTRA_SPOTS = 2
+# rectangles tried, biggest first, for a seed lined up with each wall direction
+WALL_SEED_SIZES = 40
+GRID_SEEDS = 2  # grid outlines grown, besides the shapes
+RASTER_FIT_CORNERS = True  # drop cells until a grid outline fits the corner stock
+SPOTS_TRIED = 24
+FALLBACK_BUDGET = 3.0
+FALLBACK_SHAPES = 40
+RECENT_FAILURES = 400
+SHRINK_STEPS = 4
+POLISH_TRIES = 300  # candidates tried per round before giving up
+
+Candidate = tuple[float, str, tuple[int, ...]]
+
+
+class Player10(Player):
+    """Group 10: the best-scoring rectangle, L, U, hexagon or octagon the inventory
+    can build, placed against the room's own walls, then grown face by face into
+    a free-form loop that fills the room."""
+
+    def build_enclosure(self) -> Construction | None:
+        self._best: Construction | None = None
+        self._best_score = 0.0  # a valid enclosure can score below 0; None is 0
+        self._best_shape: Shape | None = None
+        self._best_start: tuple[float, float] = (0.0, 0.0)
+        self._best_heading = 0.0
+        try:
+            self._build()
+        except Exception as e:  # noqa: BLE001 -- a crash would end the whole run
+            self.note = f"search stopped by {type(e).__name__}: {e}"
+        return self._best
+
+    def _build(self) -> None:
+        started = time.process_time()
+        weights = self.weights
+        self._assigner = Assigner(self.inventory, want_second_gate=weights.G > 0)
+        if self._assigner.gates == 0:
+            self.note = "no usable gate in the inventory -- not attempting a build"
+            return
+        self._search_room = RoomSearch(self.room)
+        self._failures: dict[str, list[tuple[int, ...]]] = {}
+        self._fitting_rectangles: list[tuple[int, int]] = []
+        self._seeds: list[Loop] = []
+        self._grid_seeds: list[Loop] = []
+        self._rectangle: tuple | None = None
+        bonus = weights.G if len(self._assigner.targets) == 2 else 0.0
+        self._bonus = bonus
+        stock = self.inventory.connectors
+        families = [
+            family
+            for family, needs in CORNERS_NEEDED.items()
+            if all(stock.get(kind, 0) >= n for kind, n in needs.items())
+        ]
+
+        # cheapest families first, so there is always something to fall back on
+        # and a score for the dearer searches to beat. Octagons are slow to rule
+        # out; U-shapes are many, and only pay off where nothing else fits.
+        stages = [
+            ([RECTANGLE], RECTANGLE_SHARE),
+            ([L_SHAPE], L_SHARE),
+            ([OCTAGON, HEXAGON], OCTAGON_SHARE),
+            ([U_SHAPE], U_SHARE),
+        ]
+        for stage, share in stages:
+            wanted = [f for f in stage if f in families]
+            if wanted:
+                self._deadline = started + TIME_BUDGET * share
+                self._search([x for f in wanted for x in self._candidates(f, bonus)])
+
+        self._raster(
+            min(
+                started + TIME_BUDGET * GROW_SHARE,
+                time.process_time() + TIME_BUDGET * RASTER_SHARE,
+            )
+        )
+
+        # loops walked along the walls: they only have to beat the best shape so
+        # far, and every one that is valid also seeds growing
+        self._deadline = time.process_time() + BEAM_SECONDS
+        self._freeform(bonus)
+
+        self._grow(started + TIME_BUDGET * GROW_SHARE)
+
+        self._deadline = started + TIME_BUDGET
+        self._polish(bonus)
+
+        if self._best is None and not self.note:
+            self.note = "nothing the inventory can build fits and scores above 0"
+
+    # ------------------------------------------------------------------ grow
+
+    def _grow(self, deadline: float) -> None:
+        """Grow the shapes found so far into free-form loops (see freeform.py)."""
+        if not self._seeds:
+            return
+        stock = self.inventory.connectors
+        grower = Grower(
+            region=self._search_room.region,
+            room_corners=self._search_room.corners,
+            buildable=set(self._assigner.lengths),
+            rights=stock.get(ConnectorType.RIGHT, 0),
+            diagonals=stock.get(ConnectorType.DIAGONAL, 0),
+            total_length=self._assigner.total_length,
+            score=lambda area, perimeter: self._score(area, perimeter) + self._bonus,
+            accept=self._accept_loop,
+            can_build=lambda lengths: self._assigner.assign(lengths) is not None,
+        )
+        self._assigner.max_nodes = GROW_ASSIGN_NODES
+        seeds = sorted(self._seeds, key=lambda loop: -loop.score)[:MAX_SEEDS]
+        # grid outlines join the shapes, rather than pushing them out: they score
+        # well at the start, but the shapes often grow further
+        seeds += sorted(self._grid_seeds, key=lambda loop: -loop.score)[:GRID_SEEDS]
+        seeds += self._other_spots()
+        seeds += self._along_walls()
+        # the charge for a side over the limit starts below what a unit of
+        # growth earns, so spreading out comes first and repairs second
+        grower.grow(seeds, deadline, first_charge=max(self.weights.A, 0.1))
+
+    def _along_walls(self) -> list[Loop]:
+        """A rectangle lined up with each of the room's main wall directions.
+        Growing keeps the angle of the shape it starts from, so without these it
+        would only ever follow the walls the first shape happened to line up with."""
+        if self._rectangle is None:
+            return []
+        best, _, _ = self._rectangle
+        used = {round(loop.heading % 90, 2) for loop in self._seeds}
+        sizes = sorted(
+            {
+                (a, b)
+                for a in self._assigner.lengths
+                for b in self._assigner.lengths
+                if b <= a
+            },
+            key=lambda p: -p[0] * p[1],
+        )
+        sizes = [p for p in sizes if p[0] * p[1] <= best.params[0] * best.params[1]]
+        seeds = []
+        for heading in self._search_room.base_headings(90):
+            if round(heading % 90, 2) in used:
+                continue
+            for a, b in sizes[:WALL_SEED_SIZES]:
+                shape = make_shape(RECTANGLE, (a, b))
+                assignment = self._assigner.assign(shape.faces)
+                if assignment is None:
+                    continue
+                spots = self._search_room.place(
+                    shape.vertices(), 90, 180, limit=1, only=[heading, heading + 90]
+                )
+                if not spots:
+                    continue
+                start, angle = spots[0]
+                construction = self._construction(shape, assignment, start, angle)
+                result = validate_construction(construction, self.room, self.inventory)
+                if result.valid:
+                    score = score_construction(result, self.weights)
+                    seeds.append(Loop(start, angle, headed_faces(shape), score))
+                    break
+        return seeds
+
+    def _other_spots(self) -> list[Loop]:
+        """The best rectangle again, at other places it fits: a room with
+        several open areas gets a seed growing in each."""
+        if self._rectangle is None:
+            return []
+        shape, first, score = self._rectangle
+        a, b = shape.params
+
+        def centre(start, heading):
+            t = math.radians(heading)
+            return (
+                start[0] + (a * math.cos(t) - b * math.sin(t)) / 2.0,
+                start[1] + (a * math.sin(t) + b * math.cos(t)) / 2.0,
+            )
+
+        taken = [centre(*first)]
+        spots = []
+        for start, heading in self._placements(shape, limit=SPOTS_TRIED):
+            here = centre(start, heading)
+            if all(math.dist(here, other) >= max(a, b) for other in taken):
+                taken.append(here)
+                spots.append(Loop(start, heading, headed_faces(shape), score))
+                if len(spots) >= EXTRA_SPOTS:
+                    break
+        return spots
+
+    def _accept_loop(
+        self, start: tuple[float, float], heading: float, faces: Faces
+    ) -> float | None:
+        """The true score of a loop, if the inventory can build it and the
+        simulator accepts it; the best one seen is kept."""
+        shape = free_shape(faces)
+        assignment = self._assigner.assign(shape.faces)
+        if assignment is None:
+            return None
+        # a loop's faces are headed from the loop's own heading, and its first
+        # face need not point along it
+        first = heading + 45.0 * faces[0][0]
+        construction = self._construction(shape, assignment, start, first)
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return None
+        score = score_construction(result, self.weights)
+        self._keep(construction, score, shape, start, first)
+        return score
+
+    # ------------------------------------------------------------ candidates
+
+    def _candidates(self, family: str, bonus: float) -> list[Candidate]:
+        """Every shape of a family worth trying, with the most it could score."""
+        lengths = self._assigner.lengths
+        usable = set(lengths)
+        if family == RECTANGLE:
+            params = [(a, b) for a in lengths for b in lengths if b <= a]
+        elif family == OCTAGON:
+            # p is the longest side: the other choices are the same octagon turned
+            params = [
+                (p, r, q, t)
+                for p in lengths
+                for r in lengths
+                if r <= p
+                for q in lengths
+                if q <= p
+                for t in lengths
+                if t <= p
+            ]
+        elif family == HEXAGON:
+            params = [(a, d1, d2) for a in lengths for d1 in lengths for d2 in lengths]
+        elif family == U_SHAPE:
+            params = [
+                (left, gap, right, height, leg)
+                for left in lengths
+                for gap in lengths
+                for right in lengths
+                if left + gap + right in usable
+                for height in lengths
+                for leg in lengths
+                if height - leg >= c.MIN_WALL_LENGTH
+            ]
+        else:
+            params = [
+                (a, b, cut, d)
+                for a in lengths
+                for cut in lengths
+                if a - cut in usable
+                for b in lengths
+                for d in lengths
+                if b + d in usable
+            ]
+        measure = MEASURES[family]
+        out = []
+        for p in params:
+            area, perimeter = measure(*p)
+            if area > self._search_room.area + c.TOL:
+                continue
+            score = self._score(area, perimeter) + bonus
+            if score > self._best_score:
+                out.append((score, family, p))
+        return out
+
+    def _score(self, area: float, perimeter: float) -> float:
+        return c.BASELINE_SCORE + self.weights.A * area + self.weights.C * perimeter
+
+    # ---------------------------------------------------------------- search
+
+    def _search(self, candidates: list[Candidate]) -> None:
+        """Try candidates from the highest score down; the first that can be built
+        and placed is the best of them."""
+        # (-score, tie-break, family, params, score is exact)
+        heap = [(-s, i, f, p, False) for i, (s, f, p) in enumerate(candidates)]
+        heapq.heapify(heap)
+        counter = len(heap)
+        timed_out = False
+
+        while heap:
+            if time.process_time() > self._deadline:
+                timed_out = True
+                break
+            negative, _, family, params, exact = heapq.heappop(heap)
+            if -negative <= self._best_score:
+                return
+            if self._cannot_fit(family, params):
+                continue
+            shape = make_shape(family, params)
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is None:
+                continue
+            if not exact:
+                score = self._score(shape.area, shape.perimeter)
+                if assignment.gate_faces >= 2:
+                    score += self.weights.G
+                if score < -negative - 1e-9:
+                    # no second gate after all: it is worth less than it was
+                    # ranked at, so let it wait its turn
+                    counter += 1
+                    heapq.heappush(heap, (-score, counter, family, params, True))
+                    continue
+            if self._try(shape, assignment):
+                return
+            self._note_failure(family, params)
+
+        if timed_out and self._best is None:
+            # ran out of time on big shapes: settle for the smallest ones
+            deadline = time.process_time() + FALLBACK_BUDGET
+            for _, _, family, params, _ in heapq.nlargest(FALLBACK_SHAPES, heap):
+                if time.process_time() > deadline:
+                    break
+                shape = make_shape(family, params)
+                assignment = self._assigner.assign(shape.faces)
+                if assignment is not None:
+                    self._try(shape, assignment)
+
+    def _cannot_fit(self, family: str, params: tuple[int, ...]) -> bool:
+        """Cheap reasons a shape can't be placed, tried before the real search."""
+        if inner_radius(family, params) > self._search_room.inradius:
+            return True
+        recent = self._failures.get(family, [])[-RECENT_FAILURES:]
+        if any(contains_smaller(family, params, small) for small in recent):
+            return True
+        return not all(
+            self._rectangle_fits(max(r), min(r))
+            for r in inner_rectangles(family, params)
+        )
+
+    def _rectangle_fits(self, a: int, b: int) -> bool:
+        """Whether an a x b rectangle (a >= b) fits anywhere in the room, whether
+        or not the inventory can build it. Remembered, and inferred from other
+        rectangles where possible."""
+        if any(fa >= a and fb >= b for fa, fb in self._fitting_rectangles):
+            return True
+        failures = self._failures.setdefault(RECTANGLE, [])
+        if any(a >= fa and b >= fb for fa, fb in failures):
+            return False
+        if inner_radius(RECTANGLE, (a, b)) > self._search_room.inradius:
+            return False
+        fits = self._placements(make_shape(RECTANGLE, (a, b)), limit=1) != []
+        (self._fitting_rectangles if fits else failures).append((a, b))
+        return fits
+
+    def _try(self, shape: Shape, assignment: Assignment) -> bool:
+        """Place the shape; keep it if it is valid and beats the best so far."""
+        for start, heading in self._placements(shape):
+            if self._try_fixed(shape, assignment, start, heading):
+                return True
+        return False
+
+    def _try_fixed(
+        self,
+        shape: Shape,
+        assignment: Assignment,
+        start: tuple[float, float],
+        heading: float,
+    ) -> bool:
+        """Build at a known start and heading; True if the simulator accepts it.
+        Every accepted shape is also kept as a seed for growing."""
+        construction = self._construction(shape, assignment, start, heading)
+        # the simulator's own judge: only what it accepts is ever returned
+        result = validate_construction(construction, self.room, self.inventory)
+        if not result.valid:
+            return False
+        score = score_construction(result, self.weights)
+        self._seeds.append(Loop(start, heading, headed_faces(shape), score))
+        if shape.family == RECTANGLE:
+            self._rectangle = (shape, (start, heading), score)
+        self._keep(construction, score, shape, start, heading)
+        return True
+
+    def _keep(self, construction, score, shape, start, heading) -> None:
+        """Remember the best construction, and the shape it came from for the
+        polish pass."""
+        if score > self._best_score:
+            self._best, self._best_score = construction, score
+            self._best_shape, self._best_start, self._best_heading = (
+                shape,
+                start,
+                heading,
+            )
+            self.note = f"{shape.describe()}, score {score:.1f}"
+
+    def _raster(self, deadline: float) -> None:
+        """Outlines of the room filled with grid cells (see raster.py)."""
+        lengths = set(self._assigner.lengths)
+        top = int(c.MAX_FACE_LENGTH)
+        sides = [
+            s
+            for s in RASTER_SIZES
+            if all(k * s in lengths for k in range(1, top // s + 1))
+        ]
+        rights = self.inventory.connectors.get(ConnectorType.RIGHT, 0)
+        if not sides or rights < 4:
+            return
+        # a one-cell step needs a single piece of exactly that length
+        single = {
+            s: self.inventory.walls.get(s, 0) + self.inventory.gates.get(s, 0)
+            for s in sides
+        }
+        pairs = sorted(
+            ((w, h) for w in sides for h in sides),
+            key=lambda p: (-min(single[p[0]], single[p[1]]), p[0] * p[1]),
+        )[:RASTER_PAIRS]
+        for start, heading, faces in raster_loops(
+            self._search_room.region,
+            self.room.polygon,
+            self._search_room.base_headings(90)[:2],
+            pairs,
+            deadline,
+            corner_budget=min(rights, RASTER_MAX_FACES) if RASTER_FIT_CORNERS else None,
+        ):
+            perimeter = sum(n for _, n in faces)
+            if (
+                len(faces) > min(rights, RASTER_MAX_FACES)
+                or perimeter > self._assigner.total_length
+            ):
+                continue
+            area = area_of(corners((0.0, 0.0), faces))
+            if self._score(area, perimeter) + self._bonus <= self._best_score:
+                continue
+            # quick count: sides only one piece can make, against that piece's stock
+            need = Counter(n for _, n in faces if n in single)
+            if any(count > single[n] for n, count in need.items()):
+                continue
+            score = self._accept_loop(start, heading, tuple(faces))
+            # a grid outline small enough to grow is a starting point for growing:
+            # it fills the room, and growing can add the diagonals it lacks
+            if score is not None and len(faces) <= MAX_FACES:
+                self._grid_seeds.append(Loop(start, heading, tuple(faces), score))
+
+    def _freeform(self, bonus: float) -> None:
+        """Free-form polygons from the beam search, best-ranked first."""
+        for shape, start, heading in free_shapes(
+            self._search_room,
+            self._assigner,
+            self.inventory,
+            self.weights,
+            self._deadline,
+        ):
+            # the most it could score; skip anything already beaten
+            if self._score(shape.area, shape.perimeter) + bonus <= self._best_score:
+                continue
+            assignment = self._assigner.assign(shape.faces)
+            if assignment is not None:
+                self._try_fixed(shape, assignment, start, heading)
+
+    def _polish(self, bonus: float) -> None:
+        """Grow and trim the best shape by adding or cutting rectangles, keeping
+        each change the simulator accepts that scores higher, until none does."""
+        if self._best_shape is None:
+            return
+        polisher = Polisher(
+            self._search_room.region,
+            self._assigner,
+            self.inventory,
+            lambda area, perimeter: self._score(area, perimeter) + bonus,
+        )
+        while time.process_time() < self._deadline:
+            before = self._best_score
+            for shape, start, heading in islice(
+                polisher.neighbours(
+                    self._best_shape,
+                    self._best_start,
+                    self._best_heading,
+                    before,
+                    self._deadline,
+                ),
+                POLISH_TRIES,
+            ):
+                assignment = self._assigner.assign(shape.faces)
+                if assignment is not None:
+                    self._try_fixed(shape, assignment, start, heading)
+                if self._best_score > before:
+                    break
+            if self._best_score <= before:
+                return
+
+    def _placements(self, shape: Shape, limit: int = 3) -> list:
+        return self._search_room.place(
+            shape.vertices(),
+            HEADING_STEP_DEG[shape.family],
+            SYMMETRY_DEG[shape.family],
+            limit,
+        )
+
+    def _note_failure(self, family: str, params: tuple[int, ...]) -> None:
+        """Remember that a shape fits nowhere. Shapes are tried biggest first, so a
+        failure on its own rules out little; a much smaller version that also
+        fails rules out everything that could hold it."""
+        failures = self._failures.setdefault(family, [])
+        smallest = params
+        if family in (RECTANGLE, OCTAGON, HEXAGON):
+            fitting, failing = 0.0, 1.0
+            for _ in range(SHRINK_STEPS):
+                scale = (fitting + failing) / 2.0
+                shrunk = tuple(max(c.MIN_WALL_LENGTH, round(scale * p)) for p in params)
+                if shrunk == smallest:
+                    break
+                if family == RECTANGLE:
+                    fits = self._rectangle_fits(max(shrunk), min(shrunk))
+                else:
+                    fits = self._placements(make_shape(family, shrunk), 1) != []
+                if fits:
+                    fitting = scale
+                else:
+                    failing, smallest = scale, shrunk
+        if smallest not in failures:
+            failures.append(smallest)
+
+    @staticmethod
+    def _construction(
+        shape: Shape,
+        assignment: Assignment,
+        start: tuple[float, float],
+        heading: float,
+    ) -> Construction:
+        pieces, connectors = [], []
+        for face, keys in enumerate(assignment.faces):
+            for i, (is_gate, length) in enumerate(keys):
+                kind = PieceType.GATE if is_gate else PieceType.WALL
+                pieces.append(Piece(kind, length))
+                connectors.append(
+                    shape.corner(face) if i == 0 else Connector(ConnectorType.STRAIGHT)
+                )
+        return Construction(start, heading, pieces, connectors)
